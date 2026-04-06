@@ -12,6 +12,13 @@ Build the project from the repository root:
 sh compile.sh
 ```
 
+For a clean rerun, stop any old server and remove the persistent database:
+
+```bash
+lsof -ti tcp:9000 | xargs kill 2>/dev/null
+rm -rf dbdata
+```
+
 Start the server in one terminal:
 
 ```bash
@@ -55,12 +62,6 @@ Parameters for `stress_benchmark` are:
 - operations per thread
 - write batch size
 
-For a clean rerun of the provided benchmark, stop the server and remove the persistent database files:
-
-```bash
-rm -rf dbdata
-```
-
 ## Storage and Durability
 
 - Primary storage is on disk inside `dbdata/`, not RAM.
@@ -69,6 +70,7 @@ rm -rf dbdata
 - Inserts are committed durably to an append-only insert WAL first, then checkpointed to table data files in batches.
 - Startup recovery loads table files, replays any unfinished journal/WAL work, and checkpoints it back to the data files.
 - Memory is used only as an accelerator through in-memory row caches and equality indexes rebuilt from persisted data.
+- Acknowledged writes are durable because the WAL is fsynced before the server replies.
 
 ## Server Model
 
@@ -77,6 +79,7 @@ rm -rf dbdata
 - SQL is accepted as semicolon-terminated statements. The parser is intentionally narrow because the benchmark sends one complete statement at a time.
 - The engine keeps persisted rows in memory as a secondary cache for faster reads, while disk remains the source of truth.
 - A batched checkpoint path reduces insert fsync overhead by flushing many committed WAL-backed rows to table files together.
+- The checkpoint threshold is intentionally large so heavy bulk loads spend most of their time appending to the durable WAL instead of rewriting table files mid-run.
 
 ## Query Support
 
@@ -99,6 +102,17 @@ Supported statements for this project:
 
 Batch insertion is supported natively by parsing and applying multi-row `INSERT INTO ... VALUES (...), (...);` statements in a single request.
 
+## Performance Optimizations
+
+- The project is compiled in release mode with `-O3 -DNDEBUG`.
+- `INSERT` statements use a specialized fast parser instead of the generic tokenizer/parser path whenever possible.
+- Multi-row inserts are supported and are the preferred way to reduce network round trips and per-statement overhead.
+- Insert rows are moved through the execution path instead of copied where possible.
+- Equality indexes are built lazily. Insert-heavy workloads do not pay index maintenance cost until a query actually needs a column index.
+- Table data files and the insert WAL stay open across requests to avoid repeated open/close overhead.
+- Checkpointing is batched so durable WAL appends stay on the hot path and table-file flushes happen less often.
+- The benchmark batch size was tuned experimentally. On this implementation, `INSERT_BATCH_SIZE = 1000` gave better results than several larger values.
+
 ## Wire Protocol
 
 - Client sends raw SQL text.
@@ -115,6 +129,7 @@ Batch insertion is supported natively by parsing and applying multi-row `INSERT 
 - Equality indexes are kept in memory to improve read and join performance, but persisted table files remain the primary durable storage.
 - Recovery is based on replaying a small journal plus an append-only insert WAL, which is much simpler than implementing a full MVCC or page-cache architecture.
 - Batched checkpointing improves insert throughput significantly, but it is still much simpler than a production-grade LSM tree or B-tree storage engine.
+- The current design is optimized primarily for the project workload shape: large batched inserts, point/equality filtering, and modest join support. A production database would need richer concurrency control, page management, and broader indexing.
 
 ## Extra Measurement Coverage
 
