@@ -32,7 +32,7 @@ namespace {
 constexpr int kPort = 9000;
 constexpr int kBacklog = 32;
 constexpr size_t kReadBufferSize = 4096;
-constexpr size_t kCheckpointInsertOps = 32768;
+constexpr size_t kCheckpointInsertOps = 16777216;
 constexpr const char *kDataDir = "dbdata";
 constexpr const char *kJournalPath = "dbdata/journal.txt";
 constexpr const char *kInsertWalPath = "dbdata/insert.wal";
@@ -75,6 +75,7 @@ struct Table {
     std::vector<Row> rows;
     std::vector<std::unordered_map<std::string, std::vector<size_t>>> equality_indexes;
     std::vector<bool> equality_index_ready;
+    size_t active_equality_indexes = 0;
     size_t flushed_rows = 0;
     long long next_row_id = 1;
     int data_fd = -1;
@@ -239,30 +240,9 @@ bool write_all_fd(int fd, const std::string &data) {
     return true;
 }
 
-bool write_all_fd(int fd, const void *data, size_t len) {
-    size_t written = 0;
-    const char *ptr = static_cast<const char *>(data);
-    while (written < len) {
-        const ssize_t rc = ::write(fd, ptr + written, len - written);
-        if (rc <= 0) {
-            return false;
-        }
-        written += static_cast<size_t>(rc);
-    }
-    return true;
-}
-
 bool read_exact(std::istream &input, char *buffer, size_t len) {
     input.read(buffer, static_cast<std::streamsize>(len));
     return static_cast<size_t>(input.gcount()) == len;
-}
-
-bool write_u32(int fd, uint32_t value) {
-    return write_all_fd(fd, &value, sizeof(value));
-}
-
-bool write_u64(int fd, uint64_t value) {
-    return write_all_fd(fd, &value, sizeof(value));
 }
 
 bool read_u32(std::istream &input, uint32_t &value) {
@@ -279,11 +259,6 @@ bool sync_file_fd(int fd) {
 #else
     return ::fsync(fd) == 0;
 #endif
-}
-
-bool write_binary_string(int fd, const std::string &value) {
-    return write_u32(fd, static_cast<uint32_t>(value.size())) &&
-           write_all_fd(fd, value.data(), value.size());
 }
 
 void append_bytes(std::string &buffer, const void *data, size_t len) {
@@ -955,11 +930,6 @@ public:
     QueryResult execute_create_table(const CreateTableStatement &statement) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
 
-        std::string checkpoint_error;
-        if (!checkpoint_locked(checkpoint_error)) {
-            return make_error(checkpoint_error);
-        }
-
         const std::string table_key = to_upper(statement.table_name);
         if (tables_.count(table_key) != 0) {
             return make_error("table " + statement.table_name + " already exists");
@@ -1022,7 +992,7 @@ public:
         return {};
     }
 
-    QueryResult execute_insert(const InsertStatement &statement) {
+    QueryResult execute_insert(InsertStatement statement) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
 
         auto table = find_table_locked(statement.table_name);
@@ -1032,14 +1002,15 @@ public:
 
         PreparedInsert prepared;
         prepared.table_name = table->name;
-        for (const auto &values : statement.rows) {
+        prepared.rows.reserve(statement.rows.size());
+        for (auto &values : statement.rows) {
             if (values.size() != table->columns.size()) {
                 return make_error("column count mismatch");
             }
 
             Row row;
             row.row_id = table->next_row_id++;
-            row.values = values;
+            row.values = std::move(values);
             prepared.rows.push_back(std::move(row));
         }
 
@@ -1048,9 +1019,14 @@ public:
         }
 
         const size_t old_size = table->rows.size();
-        table->rows.insert(table->rows.end(), prepared.rows.begin(), prepared.rows.end());
-        for (size_t i = old_size; i < table->rows.size(); ++i) {
-            index_row(*table, i);
+        table->rows.insert(
+            table->rows.end(),
+            std::make_move_iterator(prepared.rows.begin()),
+            std::make_move_iterator(prepared.rows.end()));
+        if (table->active_equality_indexes != 0) {
+            for (size_t i = old_size; i < table->rows.size(); ++i) {
+                index_row(*table, i);
+            }
         }
 
         dirty_tables_.insert(prepared.table_name);
@@ -1206,7 +1182,7 @@ private:
         return fsync_directory(kDataDir);
     }
 
-    bool append_rows_to_disk(const std::string &table_name, const std::vector<Row> &rows, std::string &error) {
+    bool append_rows_to_disk(const std::string &table_name, size_t start_row, std::string &error) {
         auto table = find_table_locked(table_name);
         if (!table) {
             error = "missing table during checkpoint";
@@ -1218,9 +1194,10 @@ private:
         }
 
         std::string buffer;
-        buffer.reserve(rows.size() * 64);
-        for (const auto &row : rows) {
-            append_binary_row(buffer, row);
+        const size_t pending_rows = table->rows.size() - start_row;
+        buffer.reserve(pending_rows * 64);
+        for (size_t i = start_row; i < table->rows.size(); ++i) {
+            append_binary_row(buffer, table->rows[i]);
         }
         const bool ok = write_all_fd(table->data_fd, buffer) && sync_file_fd(table->data_fd);
         if (!ok) {
@@ -1412,6 +1389,7 @@ private:
         table.equality_indexes.clear();
         table.equality_indexes.resize(table.columns.size());
         table.equality_index_ready.assign(table.columns.size(), false);
+        table.active_equality_indexes = 0;
         table.flushed_rows = 0;
         table.next_row_id = 1;
         return true;
@@ -1579,13 +1557,18 @@ private:
             }
 
             if (!missing_rows.empty()) {
-                if (!append_rows_to_disk(entry.table_name, missing_rows, error)) {
+                const size_t old_size = table->rows.size();
+                table->rows.insert(
+                    table->rows.end(),
+                    std::make_move_iterator(missing_rows.begin()),
+                    std::make_move_iterator(missing_rows.end()));
+                if (!append_rows_to_disk(entry.table_name, old_size, error)) {
                     return false;
                 }
-                const size_t old_size = table->rows.size();
-                table->rows.insert(table->rows.end(), missing_rows.begin(), missing_rows.end());
-                for (size_t i = old_size; i < table->rows.size(); ++i) {
-                    index_row(*table, i);
+                if (table->active_equality_indexes != 0) {
+                    for (size_t i = old_size; i < table->rows.size(); ++i) {
+                        index_row(*table, i);
+                    }
                 }
                 table->flushed_rows = table->rows.size();
                 table->next_row_id = std::max(table->next_row_id, missing_rows.back().row_id + 1);
@@ -1623,8 +1606,10 @@ private:
                     table->rows.push_back(row);
                 }
             }
-            for (size_t i = old_size; i < table->rows.size(); ++i) {
-                index_row(*table, i);
+            if (table->active_equality_indexes != 0) {
+                for (size_t i = old_size; i < table->rows.size(); ++i) {
+                    index_row(*table, i);
+                }
             }
             table->next_row_id = std::max(table->next_row_id, table->rows.empty() ? 1LL : table->rows.back().row_id + 1);
             dirty_tables_.insert(table->name);
@@ -1647,6 +1632,7 @@ private:
         table.equality_indexes.clear();
         table.equality_indexes.resize(table.columns.size());
         table.equality_index_ready.assign(table.columns.size(), false);
+        table.active_equality_indexes = 0;
     }
 
     void index_row(Table &table, size_t row_index) {
@@ -1668,6 +1654,7 @@ private:
             index[table.rows[i].values[col_idx]].push_back(i);
         }
         table.equality_index_ready[col_idx] = true;
+        table.active_equality_indexes++;
     }
 
     std::optional<size_t> resolve_column_index(const Table &table, const std::string &column_name) const {
@@ -1788,10 +1775,7 @@ private:
                 continue;
             }
 
-            std::vector<Row> pending_rows(
-                table->rows.begin() + static_cast<std::ptrdiff_t>(table->flushed_rows),
-                table->rows.end());
-            if (!append_rows_to_disk(table->name, pending_rows, error)) {
+            if (!append_rows_to_disk(table->name, table->flushed_rows, error)) {
                 return false;
             }
             table->flushed_rows = table->rows.size();
@@ -2095,7 +2079,7 @@ QueryResult execute_sql(const std::string &sql) {
         InsertStatement fast_statement;
         std::string parse_error;
         if (parse_insert_fast(sql, fast_statement, parse_error)) {
-            return g_database.execute_insert(fast_statement);
+            return g_database.execute_insert(std::move(fast_statement));
         }
         std::string tokenize_error;
         auto tokens = tokenize(sql, tokenize_error);
@@ -2104,7 +2088,7 @@ QueryResult execute_sql(const std::string &sql) {
         }
         Parser parser(std::move(tokens));
         auto statement = parser.parse_insert(parse_error);
-        return statement ? g_database.execute_insert(*statement) : QueryResult{true, parse_error, {}};
+        return statement ? g_database.execute_insert(std::move(*statement)) : QueryResult{true, parse_error, {}};
     }
     if (first == "SELECT") {
         std::string tokenize_error;
