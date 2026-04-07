@@ -75,6 +75,9 @@ struct Table {
     std::vector<Row> rows;
     std::vector<std::unordered_map<std::string, std::vector<size_t>>> equality_indexes;
     std::vector<bool> equality_index_ready;
+    std::vector<std::vector<std::pair<long double, size_t>>> numeric_indexes;
+    std::vector<bool> numeric_index_ready;
+    std::vector<bool> numeric_index_supported;
     size_t active_equality_indexes = 0;
     size_t flushed_rows = 0;
     long long next_row_id = 1;
@@ -944,6 +947,9 @@ public:
         table->columns = statement.columns;
         table->equality_indexes.resize(table->columns.size());
         table->equality_index_ready.assign(table->columns.size(), false);
+        table->numeric_indexes.resize(table->columns.size());
+        table->numeric_index_ready.assign(table->columns.size(), false);
+        table->numeric_index_supported.assign(table->columns.size(), true);
         table->flushed_rows = 0;
         for (size_t i = 0; i < table->columns.size(); ++i) {
             table->column_index[to_upper(table->columns[i].name)] = i;
@@ -1522,6 +1528,9 @@ private:
                 table->columns = entry.columns;
                 table->equality_indexes.resize(table->columns.size());
                 table->equality_index_ready.assign(table->columns.size(), false);
+                table->numeric_indexes.resize(table->columns.size());
+                table->numeric_index_ready.assign(table->columns.size(), false);
+                table->numeric_index_supported.assign(table->columns.size(), true);
                 table->flushed_rows = 0;
                 for (size_t i = 0; i < table->columns.size(); ++i) {
                     table->column_index[to_upper(table->columns[i].name)] = i;
@@ -1632,6 +1641,10 @@ private:
         table.equality_indexes.clear();
         table.equality_indexes.resize(table.columns.size());
         table.equality_index_ready.assign(table.columns.size(), false);
+        table.numeric_indexes.clear();
+        table.numeric_indexes.resize(table.columns.size());
+        table.numeric_index_ready.assign(table.columns.size(), false);
+        table.numeric_index_supported.assign(table.columns.size(), true);
         table.active_equality_indexes = 0;
     }
 
@@ -1640,6 +1653,27 @@ private:
         for (size_t col = 0; col < row.values.size() && col < table.equality_indexes.size(); ++col) {
             if (table.equality_index_ready[col]) {
                 table.equality_indexes[col][row.values[col]].push_back(row_index);
+            }
+            if (col < table.numeric_indexes.size() && table.numeric_index_ready[col]) {
+                long double numeric_value = 0;
+                if (!try_parse_number(row.values[col], numeric_value)) {
+                    table.numeric_indexes[col].clear();
+                    table.numeric_index_ready[col] = false;
+                    table.numeric_index_supported[col] = false;
+                    continue;
+                }
+                auto &index = table.numeric_indexes[col];
+                auto it = std::lower_bound(
+                    index.begin(),
+                    index.end(),
+                    std::pair<long double, size_t>{numeric_value, row_index},
+                    [](const auto &lhs, const auto &rhs) {
+                        if (lhs.first != rhs.first) {
+                            return lhs.first < rhs.first;
+                        }
+                        return lhs.second < rhs.second;
+                    });
+                index.insert(it, {numeric_value, row_index});
             }
         }
     }
@@ -1657,6 +1691,39 @@ private:
         table.active_equality_indexes++;
     }
 
+    bool ensure_numeric_index_built(Table &table, size_t col_idx) const {
+        if (col_idx >= table.numeric_indexes.size()) {
+            return false;
+        }
+        if (table.numeric_index_ready[col_idx]) {
+            return true;
+        }
+        if (!table.numeric_index_supported[col_idx]) {
+            return false;
+        }
+
+        auto &index = table.numeric_indexes[col_idx];
+        index.clear();
+        index.reserve(table.rows.size());
+        for (size_t i = 0; i < table.rows.size(); ++i) {
+            long double numeric_value = 0;
+            if (!try_parse_number(table.rows[i].values[col_idx], numeric_value)) {
+                index.clear();
+                table.numeric_index_supported[col_idx] = false;
+                return false;
+            }
+            index.push_back({numeric_value, i});
+        }
+        std::sort(index.begin(), index.end(), [](const auto &lhs, const auto &rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            return lhs.second < rhs.second;
+        });
+        table.numeric_index_ready[col_idx] = true;
+        return true;
+    }
+
     std::optional<size_t> resolve_column_index(const Table &table, const std::string &column_name) const {
         auto it = table.column_index.find(to_upper(column_name));
         if (it == table.column_index.end()) {
@@ -1672,6 +1739,54 @@ private:
             indexes.push_back(i);
         }
         return indexes;
+    }
+
+    static std::vector<size_t> sorted_row_indexes_from_numeric_range(
+        const std::vector<std::pair<long double, size_t>> &index,
+        long double low,
+        bool include_low,
+        long double high,
+        bool include_high
+    ) {
+        const auto low_it = include_low
+            ? std::lower_bound(index.begin(), index.end(), std::pair<long double, size_t>{low, 0},
+                  [](const auto &lhs, const auto &rhs) {
+                      if (lhs.first != rhs.first) {
+                          return lhs.first < rhs.first;
+                      }
+                      return lhs.second < rhs.second;
+                  })
+            : std::upper_bound(index.begin(), index.end(), std::pair<long double, size_t>{low, std::numeric_limits<size_t>::max()},
+                  [](const auto &lhs, const auto &rhs) {
+                      if (lhs.first != rhs.first) {
+                          return lhs.first < rhs.first;
+                      }
+                      return lhs.second < rhs.second;
+                  });
+
+        const auto high_it = include_high
+            ? std::upper_bound(index.begin(), index.end(), std::pair<long double, size_t>{high, std::numeric_limits<size_t>::max()},
+                  [](const auto &lhs, const auto &rhs) {
+                      if (lhs.first != rhs.first) {
+                          return lhs.first < rhs.first;
+                      }
+                      return lhs.second < rhs.second;
+                  })
+            : std::lower_bound(index.begin(), index.end(), std::pair<long double, size_t>{high, 0},
+                  [](const auto &lhs, const auto &rhs) {
+                      if (lhs.first != rhs.first) {
+                          return lhs.first < rhs.first;
+                      }
+                      return lhs.second < rhs.second;
+                  });
+
+        std::vector<size_t> matches;
+        matches.reserve(static_cast<size_t>(std::distance(low_it, high_it)));
+        for (auto it = low_it; it != high_it; ++it) {
+            matches.push_back(it->second);
+        }
+        std::sort(matches.begin(), matches.end());
+        return matches;
     }
 
     std::vector<size_t> candidate_rows_for_table(
@@ -1714,6 +1829,83 @@ private:
             std::vector<size_t> matched = (it == index.end()) ? std::vector<size_t>{} : it->second;
             if (!initialized) {
                 candidates = matched;
+                initialized = true;
+            } else {
+                std::vector<size_t> intersection;
+                std::set_intersection(
+                    candidates.begin(), candidates.end(),
+                    matched.begin(), matched.end(),
+                    std::back_inserter(intersection));
+                candidates = std::move(intersection);
+            }
+        }
+
+        for (const auto &condition : conditions) {
+            if (condition.op == "=") {
+                continue;
+            }
+
+            const Operand *column_side = nullptr;
+            const Operand *literal_side = nullptr;
+            bool literal_on_right = false;
+            if (condition.left.is_column && !condition.right.is_column) {
+                column_side = &condition.left;
+                literal_side = &condition.right;
+                literal_on_right = true;
+            } else if (!condition.left.is_column && condition.right.is_column) {
+                column_side = &condition.right;
+                literal_side = &condition.left;
+                literal_on_right = false;
+            } else {
+                continue;
+            }
+
+            if (!column_side->column.table.empty() && to_upper(column_side->column.table) != table_name) {
+                continue;
+            }
+
+            auto col_idx = resolve_column_index(table, column_side->column.column);
+            if (!col_idx || !ensure_numeric_index_built(table, *col_idx)) {
+                continue;
+            }
+
+            long double literal_value = 0;
+            if (!try_parse_number(literal_side->literal, literal_value)) {
+                continue;
+            }
+
+            long double low = -std::numeric_limits<long double>::infinity();
+            long double high = std::numeric_limits<long double>::infinity();
+            bool include_low = false;
+            bool include_high = false;
+            std::string op = condition.op;
+            if (!literal_on_right) {
+                if (op == ">") op = "<";
+                else if (op == "<") op = ">";
+                else if (op == ">=") op = "<=";
+                else if (op == "<=") op = ">=";
+            }
+
+            if (op == ">") {
+                low = literal_value;
+                include_low = false;
+            } else if (op == ">=") {
+                low = literal_value;
+                include_low = true;
+            } else if (op == "<") {
+                high = literal_value;
+                include_high = false;
+            } else if (op == "<=") {
+                high = literal_value;
+                include_high = true;
+            } else {
+                continue;
+            }
+
+            std::vector<size_t> matched = sorted_row_indexes_from_numeric_range(
+                table.numeric_indexes[*col_idx], low, include_low, high, include_high);
+            if (!initialized) {
+                candidates = std::move(matched);
                 initialized = true;
             } else {
                 std::vector<size_t> intersection;
